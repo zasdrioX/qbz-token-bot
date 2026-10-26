@@ -90,7 +90,7 @@ def format_expiry(exp_raw: str) -> str:
 
 def get_current_ist_timestamp() -> str:
     now_ist = datetime.now(IST)
-    return now_ist.strftime("%d %b %Y | %Hh%Mm IST")
+    return now_ist.strftime("%d %b %Y | %I:%M %p IST")
 
 
 async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str, str, str, bool]:
