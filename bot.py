@@ -50,10 +50,17 @@ def load_vault() -> dict:
     if os.path.exists(VAULT_FILE):
         try:
             with open(VAULT_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "limit" not in data:
+                    data["limit"] = DEFAULT_LIMIT
+                if "queue" not in data:
+                    data["queue"] = {}
+                if "history" not in data:
+                    data["history"] = {}
+                return data
         except Exception:
             pass
-    return {"limit": DEFAULT_LIMIT, "queue": {}}
+    return {"limit": DEFAULT_LIMIT, "queue": {}, "history": {}}
 
 
 def save_vault(data: dict):
@@ -112,6 +119,48 @@ def format_expiry(exp_raw: str) -> str:
 def get_current_ist_timestamp() -> str:
     now_ist = datetime.now(IST)
     return now_ist.strftime("%d %b %Y | %I:%M %p IST")
+
+
+def format_duration(seconds: float) -> str:
+    """Converts elapsed seconds to human readable days, hours, and minutes."""
+    total_seconds = int(max(0, seconds))
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+async def notify_admin_token_died(app: Client, token: str, country: str, status: str, first_seen: float):
+    """Sends a detailed alert to the bot admin DM when a token dies."""
+    if not ADMIN_USER_ID:
+        return
+
+    now_ts = time.time()
+    lifespan = format_duration(now_ts - first_seen)
+    posted_date_str = datetime.fromtimestamp(first_seen, IST).strftime("%d %b %Y | %I:%M %p IST")
+    flag = country_code_to_flag(country)
+
+    text = (
+        f"🚨 <b>Token Deceased Alert!</b>\n\n"
+        f"• <b>Country:</b> {country} {flag}\n"
+        f"• <b>Status:</b> <b>{status}</b>\n"
+        f"• <b>Survived For:</b> <code>{lifespan}</code>\n"
+        f"• <b>First Posted:</b> <code>{posted_date_str}</code>\n\n"
+        f"<b>Token:</b>\n"
+        f"<blockquote><code>{token}</code></blockquote>"
+    )
+
+    try:
+        await app.send_message(chat_id=ADMIN_USER_ID, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[-] Failed to send DM notification to admin: {e}")
 
 
 # ---------------- Qobuz API Validator ----------------
@@ -178,10 +227,6 @@ async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str,
 # ---------------- Core Synchronizer ----------------
 
 async def update_token_post(app: Client, purge_dead: bool = False, incoming_tokens: list = None) -> dict:
-    """
-    Parses channel post, validates all tokens, drains standby queue to replenish
-    dead/empty slots up to the country limit, and pushes overflow to the queue.
-    """
     global vault
     print(f"[*] Fetching post {MESSAGE_ID} from @{CHANNEL_USERNAME} (Purge: {purge_dead})...")
     msg: Message = await app.get_messages(CHANNEL_USERNAME, MESSAGE_ID)
@@ -231,7 +276,9 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
 
     max_limit = vault.get("limit", DEFAULT_LIMIT)
     standby_queue = vault.get("queue", {})
+    history = vault.get("history", {})
 
+    now_ts = time.time()
     print(f"[*] Validating {len(existing_tokens)} tokens from channel post...")
     country_groups = {}
 
@@ -240,12 +287,36 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
             token = item["token"]
             status, expiry, detected_country, is_active = await check_qobuz_token(http_client, token)
 
-            # If purging, skip dead tokens immediately
+            # Manage token lifecycle history
+            if token not in history:
+                history[token] = {
+                    "first_seen": now_ts,
+                    "country": detected_country if detected_country != "UNKNOWN" else item["assigned_country"],
+                    "notified_death": False,
+                }
+
+            token_meta = history[token]
+
+            # Check if token died and trigger DM alert
+            if not is_active:
+                if not token_meta.get("notified_death", False):
+                    await notify_admin_token_died(
+                        app=app,
+                        token=token,
+                        country=token_meta.get("country", detected_country),
+                        status=status,
+                        first_seen=token_meta.get("first_seen", now_ts),
+                    )
+                    token_meta["notified_death"] = True
+
+            # If purging, skip dead tokens from the final message
             if purge_dead and not is_active:
                 print(f"[x] Purging dead token ({status}): {token[:12]}...")
                 continue
 
             country = detected_country if detected_country != "UNKNOWN" else item["assigned_country"]
+            token_meta["country"] = country
+
             if country not in country_groups:
                 country_groups[country] = []
 
@@ -268,10 +339,16 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 continue
 
             country = detected_country
+            if new_token not in history:
+                history[new_token] = {
+                    "first_seen": now_ts,
+                    "country": country,
+                    "notified_death": False,
+                }
+
             if country not in country_groups:
                 country_groups[country] = []
 
-            # Check if active quota allows immediate publishing
             active_in_group = [t for t in country_groups[country] if t["is_active"]]
             if len(active_in_group) < max_limit:
                 country_groups[country].append({
@@ -283,7 +360,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 })
                 print(f"[+] Added active token directly to post for {country}")
             else:
-                # Country quota full -> Stash in Standby Queue
                 if country not in standby_queue:
                     standby_queue[country] = []
                 if new_token not in standby_queue[country]:
@@ -304,6 +380,14 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                     if slots_needed > 0:
                         q_status, q_expiry, _, q_active = await check_qobuz_token(http_client, queued_token)
                         if q_active:
+                            # Record first_seen at moment of publishing to post
+                            if queued_token not in history:
+                                history[queued_token] = {
+                                    "first_seen": time.time(),
+                                    "country": country,
+                                    "notified_death": False,
+                                }
+
                             replenished.append({
                                 "country": country,
                                 "token": queued_token,
@@ -320,8 +404,9 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 tokens.extend(replenished)
                 standby_queue[country] = remaining_in_queue
 
-    # Save updated standby queue state
+    # Save state
     vault["queue"] = standby_queue
+    vault["history"] = history
     save_vault(vault)
 
     # 3. Build formatted message
@@ -482,7 +567,6 @@ async def dm_purge_cmd(client: Client, message: Message):
 
 @app.on_message(filters.private & admin_filter & filters.text)
 async def dm_add_tokens_handler(client: Client, message: Message):
-    """Detects raw tokens sent by admin in DM and processes them."""
     global LAST_CHECK_TIMESTAMP
     token_pattern = re.compile(r"[A-Za-z0-9_-]{70,}")
     found_tokens = token_pattern.findall(message.text)
@@ -512,7 +596,10 @@ async def callback_handler(client: Client, callback: CallbackQuery):
     global LAST_CHECK_TIMESTAMP
 
     if ADMIN_USER_ID and callback.from_user.id != ADMIN_USER_ID:
-        msg = "⛔ Access denied: Only bot admin can perform this."
+        if callback.data == "purge_dead_tokens":
+            msg = "⛔ Access denied: Only bot admin can purge tokens."
+        else:
+            msg = "⛔ Access denied: Only bot admin can trigger re-checks."
         await callback.answer(msg, show_alert=True)
         return
 
@@ -601,7 +688,7 @@ async def main():
         print(f"[-] Initial check error: {e}")
 
     asyncio.create_task(scheduler_loop(app))
-    print("[+] Scheduler & DM Listeners active. Bot is ready!")
+    print("[+] Scheduler, Lifespan Monitor & DM Listeners active. Bot is ready!")
     await idle()
     await app.stop()
 
