@@ -1,12 +1,13 @@
 import os
 import re
+import json
 import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 import httpx
 from aiohttp import web
 from dotenv import load_dotenv
-from pyrogram import Client, idle
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.errors import RPCError
 from pyrogram.types import (
@@ -16,7 +17,6 @@ from pyrogram.types import (
     Message,
 )
 
-# Load environment variables
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -24,6 +24,7 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
+DEFAULT_LIMIT = int(os.getenv("MAX_TOKENS_PER_COUNTRY", "2"))
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise ValueError("Missing API_ID, API_HASH, or BOT_TOKEN in environment!")
@@ -31,19 +32,39 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 CHANNEL_USERNAME = "QbzTokens"
 MESSAGE_ID = 3
 
-# Qobuz App Configuration
 QOBUZ_APP_ID = "312369995"
 API_BASE = "https://www.qobuz.com/api.json/0.2/"
 
-# Rate limiting lock & timestamp
 LAST_CHECK_TIMESTAMP = 0.0
 RATE_LIMIT_SECONDS = 10
 CHECK_INTERVAL_SECONDS = 1 * 3600  # 1 Hour
 CHECK_LOCK = asyncio.Lock()
 
-# Indian Standard Time (+05:30)
 IST = timezone(timedelta(hours=5, minutes=30))
+VAULT_FILE = "tokens_vault.json"
 
+
+# ---------------- State & Standby Queue Storage ----------------
+
+def load_vault() -> dict:
+    if os.path.exists(VAULT_FILE):
+        try:
+            with open(VAULT_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"limit": DEFAULT_LIMIT, "queue": {}}
+
+
+def save_vault(data: dict):
+    with open(VAULT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+vault = load_vault()
+
+
+# ---------------- Utilities & Formatters ----------------
 
 def get_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -93,12 +114,10 @@ def get_current_ist_timestamp() -> str:
     return now_ist.strftime("%d %b %Y | %I:%M %p IST")
 
 
-async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str, str, str, bool]:
-    params = {
-        "app_id": QOBUZ_APP_ID,
-        "user_auth_token": token,
-    }
+# ---------------- Qobuz API Validator ----------------
 
+async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str, str, str, bool]:
+    params = {"app_id": QOBUZ_APP_ID, "user_auth_token": token}
     try:
         resp = await client.get(
             f"{API_BASE}user/get",
@@ -106,7 +125,6 @@ async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str,
             headers=qobuz_headers(token),
             timeout=10,
         )
-
         try:
             data = resp.json()
         except Exception:
@@ -157,13 +175,20 @@ async def check_qobuz_token(client: httpx.AsyncClient, token: str) -> tuple[str,
         return "⚠️ [CHECK FAILED]", "N/A", "UNKNOWN", False
 
 
-async def update_token_post(app: Client, purge_dead: bool = False):
+# ---------------- Core Synchronizer ----------------
+
+async def update_token_post(app: Client, purge_dead: bool = False, incoming_tokens: list = None) -> dict:
+    """
+    Parses channel post, validates all tokens, drains standby queue to replenish
+    dead/empty slots up to the country limit, and pushes overflow to the queue.
+    """
+    global vault
     print(f"[*] Fetching post {MESSAGE_ID} from @{CHANNEL_USERNAME} (Purge: {purge_dead})...")
     msg: Message = await app.get_messages(CHANNEL_USERNAME, MESSAGE_ID)
 
     if not msg or not msg.text:
         print("[-] Could not retrieve message content.")
-        return
+        return {"status": "error", "message": "Failed to fetch post"}
 
     content = msg.text
     lines = content.split("\n")
@@ -175,8 +200,9 @@ async def update_token_post(app: Client, purge_dead: bool = False):
     seen_tokens = set()
     current_country = "UNKNOWN"
     title = lines[0].strip() if lines else "Qobuz Studio 2M Trial Tokens ✨"
-    unformatted_new_tokens = []
+    unformatted_loose_tokens = incoming_tokens or []
 
+    # 1. Parse tokens from the existing channel post
     for line in lines[1:]:
         stripped = line.strip()
         if not stripped:
@@ -201,22 +227,29 @@ async def update_token_post(app: Client, purge_dead: bool = False):
                 if current_country != "UNKNOWN":
                     existing_tokens.append({"token": stripped, "assigned_country": current_country})
                 else:
-                    unformatted_new_tokens.append(stripped)
+                    unformatted_loose_tokens.append(stripped)
 
-    print(f"[*] Validating {len(existing_tokens)} existing tokens...")
-    validated_tokens = []
+    max_limit = vault.get("limit", DEFAULT_LIMIT)
+    standby_queue = vault.get("queue", {})
+
+    print(f"[*] Validating {len(existing_tokens)} tokens from channel post...")
+    country_groups = {}
 
     async with httpx.AsyncClient() as http_client:
         for item in existing_tokens:
             token = item["token"]
             status, expiry, detected_country, is_active = await check_qobuz_token(http_client, token)
 
+            # If purging, skip dead tokens immediately
             if purge_dead and not is_active:
                 print(f"[x] Purging dead token ({status}): {token[:12]}...")
                 continue
 
             country = detected_country if detected_country != "UNKNOWN" else item["assigned_country"]
-            validated_tokens.append({
+            if country not in country_groups:
+                country_groups[country] = []
+
+            country_groups[country].append({
                 "country": country,
                 "token": token,
                 "status": status,
@@ -224,32 +257,79 @@ async def update_token_post(app: Client, purge_dead: bool = False):
                 "is_active": is_active,
             })
 
-        if unformatted_new_tokens:
-            print(f"[*] Found {len(unformatted_new_tokens)} newly pasted loose tokens...")
-            for new_token in unformatted_new_tokens:
-                status, expiry, detected_country, is_active = await check_qobuz_token(http_client, new_token)
-                if is_active:
-                    validated_tokens.append({
-                        "country": detected_country,
-                        "token": new_token,
-                        "status": status,
-                        "expiry": expiry,
-                        "is_active": is_active,
-                    })
-                    print(f"[+] Ingested active token for {detected_country}: {new_token[:12]}...")
-                else:
-                    print(f"[-] Dropped inactive/invalid new token: {status}")
+        # Process incoming/unformatted tokens
+        for new_token in unformatted_loose_tokens:
+            if new_token in seen_tokens:
+                continue
+            seen_tokens.add(new_token)
+            status, expiry, detected_country, is_active = await check_qobuz_token(http_client, new_token)
+            if not is_active:
+                print(f"[-] Dropped inactive loose token: {status}")
+                continue
 
-    country_groups = {}
-    for entry in validated_tokens:
-        cc = entry["country"]
-        if cc not in country_groups:
-            country_groups[cc] = []
-        country_groups[cc].append(entry)
+            country = detected_country
+            if country not in country_groups:
+                country_groups[country] = []
 
+            # Check if active quota allows immediate publishing
+            active_in_group = [t for t in country_groups[country] if t["is_active"]]
+            if len(active_in_group) < max_limit:
+                country_groups[country].append({
+                    "country": country,
+                    "token": new_token,
+                    "status": status,
+                    "expiry": expiry,
+                    "is_active": True,
+                })
+                print(f"[+] Added active token directly to post for {country}")
+            else:
+                # Country quota full -> Stash in Standby Queue
+                if country not in standby_queue:
+                    standby_queue[country] = []
+                if new_token not in standby_queue[country]:
+                    standby_queue[country].append(new_token)
+                print(f"[~] Quota reached for {country} ({len(active_in_group)}/{max_limit}). Queued to standby.")
+
+        # 2. Replenish dead slots from Standby Queue
+        for country, tokens in country_groups.items():
+            active_count = sum(1 for t in tokens if t["is_active"])
+            slots_needed = max_limit - active_count
+
+            if slots_needed > 0 and country in standby_queue and standby_queue[country]:
+                print(f"[*] Attempting to replenish {slots_needed} slot(s) for {country} from standby...")
+                replenished = []
+                remaining_in_queue = []
+
+                for queued_token in standby_queue[country]:
+                    if slots_needed > 0:
+                        q_status, q_expiry, _, q_active = await check_qobuz_token(http_client, queued_token)
+                        if q_active:
+                            replenished.append({
+                                "country": country,
+                                "token": queued_token,
+                                "status": q_status,
+                                "expiry": q_expiry,
+                                "is_active": True,
+                            })
+                            slots_needed -= 1
+                        else:
+                            print(f"[x] Discarded dead token from standby: {queued_token[:12]}...")
+                    else:
+                        remaining_in_queue.append(queued_token)
+
+                tokens.extend(replenished)
+                standby_queue[country] = remaining_in_queue
+
+    # Save updated standby queue state
+    vault["queue"] = standby_queue
+    save_vault(vault)
+
+    # 3. Build formatted message
     output_parts = [f"<b>{title}</b>\n"]
 
-    for idx, (cc, tokens) in enumerate(country_groups.items(), 1):
+    for idx, (cc, tokens) in enumerate(sorted(country_groups.items()), 1):
+        if not tokens:
+            continue
         flag = country_code_to_flag(cc)
         output_parts.append(f"<b><i>{idx}. {cc} {flag}</i></b>")
 
@@ -293,8 +373,11 @@ async def update_token_post(app: Client, purge_dead: bool = False):
         reply_markup=get_keyboard(),
         disable_web_page_preview=True,
     )
-    print(f"[+] Message updated at {last_checked_timestamp}!")
+    print(f"[+] Channel post successfully updated at {last_checked_timestamp}!")
+    return {"status": "ok", "timestamp": last_checked_timestamp}
 
+
+# ---------------- Telegram Bot Instance & DM Handlers ----------------
 
 app = Client(
     "qobuz_token_checker",
@@ -305,15 +388,131 @@ app = Client(
 )
 
 
+def admin_only_filter(_, __, message: Message):
+    return message.from_user and message.from_user.id == ADMIN_USER_ID
+
+
+admin_filter = filters.create(admin_only_filter)
+
+
+@app.on_message(filters.private & admin_filter & filters.command("start"))
+async def dm_start_cmd(_, message: Message):
+    limit = vault.get("limit", DEFAULT_LIMIT)
+    text = (
+        "👑 <b>Qobuz Token Checker Admin Console</b>\n\n"
+        f"• <b>Max tokens per region:</b> <code>{limit}</code>\n\n"
+        "<b>Available Commands:</b>\n"
+        "• <code>/recheck</code> - Force refresh of channel post & queue\n"
+        "• <code>/purge</code> - Remove all expired/invalid tokens from post\n"
+        "• <code>/limit &lt;number&gt;</code> - Change max tokens shown per region\n"
+        "• <code>/queue</code> - View tokens stored in standby\n\n"
+        "💡 <i>To add new tokens: simply send or paste raw tokens directly into this chat!</i>"
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.private & admin_filter & filters.command("limit"))
+async def dm_set_limit(_, message: Message):
+    global vault
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.reply_text("⚠️ Usage: <code>/limit 2</code> (must be a number)", parse_mode=ParseMode.HTML)
+        return
+
+    new_limit = int(parts[1])
+    if new_limit < 1:
+        await message.reply_text("⚠️ Limit must be at least 1.")
+        return
+
+    vault["limit"] = new_limit
+    save_vault(vault)
+    await message.reply_text(f"✅ Max tokens per country set to: <b>{new_limit}</b>", parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.private & admin_filter & filters.command("queue"))
+async def dm_queue_cmd(_, message: Message):
+    queue = vault.get("queue", {})
+    total = sum(len(v) for v in queue.values())
+    if not total:
+        await message.reply_text("📦 Standby Queue is empty.", parse_mode=ParseMode.HTML)
+        return
+
+    report = [f"📦 <b>Standby Tokens Queue ({total} total):</b>\n"]
+    for cc, tokens in queue.items():
+        if tokens:
+            flag = country_code_to_flag(cc)
+            report.append(f"• <b>{cc} {flag}:</b> {len(tokens)} token(s) waiting")
+
+    await message.reply_text("\n".join(report), parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.private & admin_filter & filters.command("recheck"))
+async def dm_recheck_cmd(client: Client, message: Message):
+    global LAST_CHECK_TIMESTAMP
+    if CHECK_LOCK.locked():
+        await message.reply_text("⏳ Check in progress. Please wait...")
+        return
+
+    wait_msg = await message.reply_text("🔄 Checking tokens & updating post...")
+    async with CHECK_LOCK:
+        LAST_CHECK_TIMESTAMP = time.time()
+        try:
+            res = await update_token_post(client, purge_dead=False)
+            await wait_msg.edit_text(f"✅ Updated post successfully at {res.get('timestamp')}")
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ Failed: {e}")
+
+
+@app.on_message(filters.private & admin_filter & filters.command("purge"))
+async def dm_purge_cmd(client: Client, message: Message):
+    global LAST_CHECK_TIMESTAMP
+    if CHECK_LOCK.locked():
+        await message.reply_text("⏳ A check is currently running. Please wait...")
+        return
+
+    wait_msg = await message.reply_text("🧹 Purging dead tokens & filling from standby...")
+    async with CHECK_LOCK:
+        LAST_CHECK_TIMESTAMP = time.time()
+        try:
+            res = await update_token_post(client, purge_dead=True)
+            await wait_msg.edit_text(f"✅ Post purged & updated at {res.get('timestamp')}")
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ Failed: {e}")
+
+
+@app.on_message(filters.private & admin_filter & filters.text)
+async def dm_add_tokens_handler(client: Client, message: Message):
+    """Detects raw tokens sent by admin in DM and processes them."""
+    global LAST_CHECK_TIMESTAMP
+    token_pattern = re.compile(r"[A-Za-z0-9_-]{70,}")
+    found_tokens = token_pattern.findall(message.text)
+
+    if not found_tokens:
+        return
+
+    status_msg = await message.reply_text(f"🔍 Found {len(found_tokens)} token(s). Validating...")
+
+    async with CHECK_LOCK:
+        LAST_CHECK_TIMESTAMP = time.time()
+        try:
+            res = await update_token_post(client, purge_dead=False, incoming_tokens=found_tokens)
+            await status_msg.edit_text(
+                f"✅ Done!\nPost updated & active quota verified.\nOverflow tokens (if any) saved to standby queue.\n\n"
+                f"🕒 Updated at: <b>{res.get('timestamp')}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error updating: {e}")
+
+
+# ---------------- Channel Button Callback Handler ----------------
+
 @app.on_callback_query()
 async def callback_handler(client: Client, callback: CallbackQuery):
     global LAST_CHECK_TIMESTAMP
 
     if ADMIN_USER_ID and callback.from_user.id != ADMIN_USER_ID:
-        if callback.data == "purge_dead_tokens":
-            msg = "⛔ Access denied: Only bot admin can purge tokens."
-        else:
-            msg = "⛔ Access denied: Only bot admin can trigger re-checks."
+        msg = "⛔ Access denied: Only bot admin can perform this."
         await callback.answer(msg, show_alert=True)
         return
 
@@ -347,6 +546,8 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 print(f"[-] Callback update failed: {e}")
 
 
+# ---------------- Hourly Background Scheduler ----------------
+
 async def scheduler_loop(client: Client):
     global LAST_CHECK_TIMESTAMP
     while True:
@@ -364,6 +565,8 @@ async def scheduler_loop(client: Client):
         await asyncio.sleep(60)
 
 
+# ---------------- Dummy Web Server for Render ----------------
+
 async def handle_ping(request):
     return web.Response(text="Qobuz Token Bot is running OK!")
 
@@ -379,15 +582,14 @@ async def start_web_server():
     print(f"[+] Web server listening on port {PORT}")
 
 
+# ---------------- Main Entry Point ----------------
+
 async def main():
     global LAST_CHECK_TIMESTAMP
 
-    # 1. Start HTTP health server for Render
     await start_web_server()
-
-    # 2. Start Pyrogram client
     await app.start()
-    print("[+] Bot started. Executing initial check...")
+    print("[+] Bot started. Executing initial token check...")
 
     try:
         async with CHECK_LOCK:
@@ -398,10 +600,8 @@ async def main():
     except Exception as e:
         print(f"[-] Initial check error: {e}")
 
-    # 3. Start background scheduler
     asyncio.create_task(scheduler_loop(app))
-
-    print("[+] Scheduler active (every hour). Monitoring button callbacks...")
+    print("[+] Scheduler & DM Listeners active. Bot is ready!")
     await idle()
     await app.stop()
 
