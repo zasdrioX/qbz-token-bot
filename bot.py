@@ -17,6 +17,7 @@ from pyrogram.types import (
     Message,
 )
 
+# Load environment configuration
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -32,14 +33,17 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 CHANNEL_USERNAME = "QbzTokens"
 MESSAGE_ID = 3
 
+# Qobuz API Configuration
 QOBUZ_APP_ID = "312369995"
 API_BASE = "https://www.qobuz.com/api.json/0.2/"
 
+# Rate limiting lock & timestamp tracking
 LAST_CHECK_TIMESTAMP = 0.0
 RATE_LIMIT_SECONDS = 10
 CHECK_INTERVAL_SECONDS = 1 * 3600  # 1 Hour
 CHECK_LOCK = asyncio.Lock()
 
+# Indian Standard Time (UTC+05:30)
 IST = timezone(timedelta(hours=5, minutes=30))
 VAULT_FILE = "tokens_vault.json"
 
@@ -122,7 +126,6 @@ def get_current_ist_timestamp() -> str:
 
 
 def format_duration(seconds: float) -> str:
-    """Converts elapsed seconds to human readable days, hours, and minutes."""
     total_seconds = int(max(0, seconds))
     days = total_seconds // 86400
     hours = (total_seconds % 86400) // 3600
@@ -134,12 +137,12 @@ def format_duration(seconds: float) -> str:
     if hours > 0 or days > 0:
         parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
-    return " ".join(parts)
+    return " ".join(parts) if parts else "0m"
 
 
 async def notify_admin_token_died(app: Client, token: str, country: str, status: str, first_seen: float):
-    """Sends a detailed alert to the bot admin DM when a token dies."""
     if not ADMIN_USER_ID:
+        print("[-] Notification skipped: ADMIN_USER_ID not configured!")
         return
 
     now_ts = time.time()
@@ -158,7 +161,10 @@ async def notify_admin_token_died(app: Client, token: str, country: str, status:
     )
 
     try:
-        await app.send_message(chat_id=ADMIN_USER_ID, text=text, parse_mode=ParseMode.HTML)
+        await app.send_message(chat_id=int(ADMIN_USER_ID), text=text, parse_mode=ParseMode.HTML)
+        print(f"[+] Death notification delivered to admin ({ADMIN_USER_ID}) for {country} token!")
+    except RPCError as e:
+        print(f"[-] Telegram RPC Error sending DM to {ADMIN_USER_ID}: {e.MESSAGE or e}")
     except Exception as e:
         print(f"[-] Failed to send DM notification to admin: {e}")
 
@@ -247,7 +253,7 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
     title = lines[0].strip() if lines else "Qobuz Studio 2M Trial Tokens ✨"
     unformatted_loose_tokens = incoming_tokens or []
 
-    # 1. Parse tokens from the existing channel post
+    # 1. Parse tokens from existing channel post
     for line in lines[1:]:
         stripped = line.strip()
         if not stripped:
@@ -286,36 +292,39 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
         for item in existing_tokens:
             token = item["token"]
             status, expiry, detected_country, is_active = await check_qobuz_token(http_client, token)
+            country = detected_country if detected_country != "UNKNOWN" else item["assigned_country"]
 
-            # Manage token lifecycle history
+            # Initialize history record if token wasn't seen before
             if token not in history:
                 history[token] = {
                     "first_seen": now_ts,
-                    "country": detected_country if detected_country != "UNKNOWN" else item["assigned_country"],
+                    "country": country,
+                    "last_status": status,
+                    "is_active": is_active,
                     "notified_death": False,
                 }
 
             token_meta = history[token]
 
-            # Check if token died and trigger DM alert
-            if not is_active:
-                if not token_meta.get("notified_death", False):
-                    await notify_admin_token_died(
-                        app=app,
-                        token=token,
-                        country=token_meta.get("country", detected_country),
-                        status=status,
-                        first_seen=token_meta.get("first_seen", now_ts),
-                    )
-                    token_meta["notified_death"] = True
+            # Trigger death notification if transitioning to inactive
+            if not is_active and not token_meta.get("notified_death", False):
+                await notify_admin_token_died(
+                    app=app,
+                    token=token,
+                    country=country,
+                    status=status,
+                    first_seen=token_meta.get("first_seen", now_ts),
+                )
+                token_meta["notified_death"] = True
 
-            # If purging, skip dead tokens from the final message
+            token_meta["is_active"] = is_active
+            token_meta["last_status"] = status
+            token_meta["country"] = country
+
+            # Skip dead tokens if purge mode is active
             if purge_dead and not is_active:
                 print(f"[x] Purging dead token ({status}): {token[:12]}...")
                 continue
-
-            country = detected_country if detected_country != "UNKNOWN" else item["assigned_country"]
-            token_meta["country"] = country
 
             if country not in country_groups:
                 country_groups[country] = []
@@ -343,6 +352,8 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 history[new_token] = {
                     "first_seen": now_ts,
                     "country": country,
+                    "last_status": status,
+                    "is_active": True,
                     "notified_death": False,
                 }
 
@@ -380,11 +391,12 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                     if slots_needed > 0:
                         q_status, q_expiry, _, q_active = await check_qobuz_token(http_client, queued_token)
                         if q_active:
-                            # Record first_seen at moment of publishing to post
                             if queued_token not in history:
                                 history[queued_token] = {
                                     "first_seen": time.time(),
                                     "country": country,
+                                    "last_status": q_status,
+                                    "is_active": True,
                                     "notified_death": False,
                                 }
 
@@ -404,7 +416,7 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 tokens.extend(replenished)
                 standby_queue[country] = remaining_in_queue
 
-    # Save state
+    # Save persistence updates
     vault["queue"] = standby_queue
     vault["history"] = history
     save_vault(vault)
@@ -491,7 +503,7 @@ async def dm_start_cmd(_, message: Message):
         "• <code>/purge</code> - Remove all expired/invalid tokens from post\n"
         "• <code>/limit &lt;number&gt;</code> - Change max tokens shown per region\n"
         "• <code>/queue</code> - View tokens stored in standby\n\n"
-        "💡 <i>To add new tokens: simply send or paste raw tokens directly into this chat!</i>"
+        "💡 <i>To add new tokens: send or paste raw tokens directly into this chat!</i>"
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -581,7 +593,7 @@ async def dm_add_tokens_handler(client: Client, message: Message):
         try:
             res = await update_token_post(client, purge_dead=False, incoming_tokens=found_tokens)
             await status_msg.edit_text(
-                f"✅ Done!\nPost updated & active quota verified.\nOverflow tokens (if any) saved to standby queue.\n\n"
+                f"✅ Done!\nPost updated & regional limits applied.\nOverflow tokens (if any) saved to standby queue.\n\n"
                 f"🕒 Updated at: <b>{res.get('timestamp')}</b>",
                 parse_mode=ParseMode.HTML,
             )
