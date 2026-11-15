@@ -707,3 +707,70 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
+
+@app.on_message(filters.private & filters.command("gen"))
+async def dm_gen_cmd(client: Client, message: Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply_text("⚠️ <b>Usage:</b>\n<code>/gen email password</code>", parse_mode=ParseMode.HTML)
+        return
+
+    email = parts[1]
+    password = parts[2]
+    status_msg = await message.reply_text("⏳ Authenticating with Qobuz...")
+
+    params = {
+        "app_id": QOBUZ_APP_ID,
+        "app_secret": "e79f8b9be485692b0e5f9dd895826368",
+        "username": email,
+        "password": password
+    }
+
+    try:
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.get(f"{API_BASE}user/login", params=params, headers=qobuz_headers(""), timeout=15)
+            data = resp.json() if resp.text else {}
+
+            if resp.status_code == 200 and "user_auth_token" in data:
+                token = data.get("user_auth_token")
+                user = data.get("user", {})
+                credential = user.get("credential", {})
+                subscription = user.get("subscription", {})
+
+                country = user.get("country_code", "UNKNOWN")
+                flag = country_code_to_flag(country)
+                
+                plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
+                
+                start_raw = subscription.get("start_date")
+                start_date = format_expiry(start_raw) if start_raw else "N/A"
+                
+                exp_raw = subscription.get("end_date") or credential.get("end_date")
+                exp_date = format_expiry(exp_raw) if exp_raw else "N/A"
+
+                account_type = "👤 Individual"
+                plan_lower = plan_name.lower()
+                if "family" in plan_lower:
+                    if "master" in plan_lower:
+                        account_type = "👨‍👩‍👧‍👦 Family (Parent/Admin)"
+                    elif "member" in plan_lower:
+                        account_type = "👤 Family (Member)"
+                    else:
+                        account_type = "👨‍👩‍👧‍👦 Family Plan"
+
+                text = (
+                    f"✅ <b>Authentication Successful!</b>\n\n"
+                    f"• <b>Country:</b> {country} {flag}\n"
+                    f"• <b>Plan:</b> <code>{plan_name}</code>\n"
+                    f"• <b>Account Role:</b> {account_type}\n"
+                    f"• <b>Start Date:</b> <code>{start_date}</code>\n"
+                    f"• <b>Expiry Date:</b> <code>{exp_date}</code>\n\n"
+                    f"<b>Token:</b>\n"
+                    f"<blockquote><code>{token}</code></blockquote>"
+                )
+                await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+            else:
+                err = data.get("message") or data.get("error_code") or "Invalid credentials."
+                await status_msg.edit_text(f"❌ <b>Login Failed:</b> <code>{err}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
