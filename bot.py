@@ -602,8 +602,11 @@ async def dm_gen_cmd(client: Client, message: Message):
 
             if resp.status_code == 200 and "user_auth_token" in data:
                 token = data.get("user_auth_token")
-                user = data.get("user") or {}
                 
+                # SECONDARY CHECK: Immediately test if the generated token is actually allowed to stream
+                val_status, _, _, is_streamable = await check_qobuz_token(http_client, token)
+
+                user = data.get("user") or {}
                 credential = user.get("credential") or {}
                 subscription = user.get("subscription") or {}
                 parameters = credential.get("parameters") or {}
@@ -623,11 +626,17 @@ async def dm_gen_cmd(client: Client, message: Message):
                 
                 plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
                 
-                is_active = bool(parameters)
                 hires = parameters.get("hires_streaming", False)
                 lossless = parameters.get("lossless_streaming", False)
                 
-                if is_active:
+                # Apply the strict validator's result to the display status
+                if "BLOCKED" in val_status:
+                    status_str = "🚫 Blocked by Qobuz"
+                elif "INVALID" in val_status:
+                    status_str = "❌ Invalid Token"
+                elif "EXPIRED" in val_status:
+                    status_str = "⚠️ Expired"
+                elif is_streamable:
                     if hires:
                         status_str = "✅ Active (Hi-Res)"
                     elif lossless:
@@ -635,7 +644,7 @@ async def dm_gen_cmd(client: Client, message: Message):
                     else:
                         status_str = "✅ Active (Standard)"
                 else:
-                    status_str = "❌ Inactive / Free Tier"
+                    status_str = "⚪ Free Tier / Inactive"
 
                 source = str(parameters.get("source", "")).lower()
                 household_size = subscription.get("household_size_max") if isinstance(subscription, dict) else None
