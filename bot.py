@@ -590,7 +590,6 @@ async def dm_gen_cmd(client: Client, message: Message):
         "password": password
     }
 
-    # Clean headers identical to the working test script
     login_headers = {
         "X-Device-Platform": "android",
         "X-App-Version": "5.16.1.5"
@@ -605,36 +604,61 @@ async def dm_gen_cmd(client: Client, message: Message):
                 token = data.get("user_auth_token")
                 user = data.get("user") or {}
                 
-                # Safely handle null data for Family Member accounts
                 credential = user.get("credential") or {}
                 subscription = user.get("subscription") or {}
+                parameters = credential.get("parameters") or {}
 
+                # User Identity
+                display_name = user.get("display_name") or "Unknown"
                 country = user.get("country_code", "UNKNOWN")
                 flag = country_code_to_flag(country)
                 
-                plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
-                
+                # Dates
+                creation_raw = str(user.get("creation_date", "")).split("T")[0]
+                creation_date = format_expiry(creation_raw) if creation_raw else "Unknown"
+
                 start_raw = subscription.get("start_date")
                 start_date = format_expiry(start_raw) if start_raw else "N/A"
                 
                 exp_raw = subscription.get("end_date") or credential.get("end_date")
                 exp_date = format_expiry(exp_raw) if exp_raw else "N/A"
+                
+                # Plan & Streaming Status
+                plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
+                
+                is_active = bool(parameters)
+                hires = parameters.get("hires_streaming", False)
+                lossless = parameters.get("lossless_streaming", False)
+                
+                if is_active:
+                    if hires:
+                        status_str = "✅ Active (Hi-Res)"
+                    elif lossless:
+                        status_str = "✅ Active (Lossless)"
+                    else:
+                        status_str = "✅ Active (Standard)"
+                else:
+                    status_str = "❌ Inactive / Free Tier"
 
-                account_type = "👤 Individual"
+                # Account Role Logic
                 plan_lower = plan_name.lower()
                 source = str(credential.get("source", "")).lower()
                 
-                if "family" in plan_lower or source == "household":
-                    if "master" in plan_lower:
-                        account_type = "👨‍👩‍👧‍👦 Family (Parent/Admin)"
-                    else:
-                        account_type = "👤 Family (Member)"
+                if source == "household":
+                    account_type = "👨‍👩‍👧‍👦 Family Member"
+                elif "family" in plan_lower:
+                    account_type = "👑 Family Owner"
+                else:
+                    account_type = "👤 Individual"
 
                 text = (
                     f"✅ <b>Authentication Successful!</b>\n\n"
+                    f"• <b>User:</b> <code>{display_name}</code>\n"
                     f"• <b>Country:</b> {country} {flag}\n"
+                    f"• <b>Created:</b> <code>{creation_date}</code>\n"
                     f"• <b>Plan:</b> <code>{plan_name}</code>\n"
-                    f"• <b>Account Role:</b> {account_type}\n"
+                    f"• <b>Role:</b> {account_type}\n"
+                    f"• <b>Status:</b> <b>{status_str}</b>\n"
                     f"• <b>Start Date:</b> <code>{start_date}</code>\n"
                     f"• <b>Expiry Date:</b> <code>{exp_date}</code>\n\n"
                     f"<b>Token:</b>\n"
