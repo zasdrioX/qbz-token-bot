@@ -608,12 +608,10 @@ async def dm_gen_cmd(client: Client, message: Message):
                 subscription = user.get("subscription") or {}
                 parameters = credential.get("parameters") or {}
 
-                # User Identity
                 display_name = user.get("display_name") or "Unknown"
                 country = user.get("country_code", "UNKNOWN")
                 flag = country_code_to_flag(country)
                 
-                # Dates
                 creation_raw = str(user.get("creation_date", "")).split("T")[0]
                 creation_date = format_expiry(creation_raw) if creation_raw else "Unknown"
 
@@ -623,7 +621,6 @@ async def dm_gen_cmd(client: Client, message: Message):
                 exp_raw = subscription.get("end_date") or credential.get("end_date")
                 exp_date = format_expiry(exp_raw) if exp_raw else "N/A"
                 
-                # Plan & Streaming Status
                 plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
                 
                 is_active = bool(parameters)
@@ -640,14 +637,13 @@ async def dm_gen_cmd(client: Client, message: Message):
                 else:
                     status_str = "❌ Inactive / Free Tier"
 
-                # Account Role Logic
-                plan_lower = plan_name.lower()
-                source = str(credential.get("source", "")).lower()
+                source = str(parameters.get("source", "")).lower()
+                household_size = subscription.get("household_size_max") if isinstance(subscription, dict) else None
                 
                 if source == "household":
                     account_type = "👨‍👩‍👧‍👦 Family Member"
-                elif "family" in plan_lower:
-                    account_type = "👑 Family Owner"
+                elif household_size and household_size > 1:
+                    account_type = f"👑 Family Owner (Max {household_size} Members)"
                 else:
                     account_type = "👤 Individual"
 
