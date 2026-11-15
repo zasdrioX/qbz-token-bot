@@ -15,6 +15,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    BotCommand,
 )
 
 # Load environment configuration
@@ -253,7 +254,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
     title = lines[0].strip() if lines else "Qobuz Studio 2M Trial Tokens ✨"
     unformatted_loose_tokens = incoming_tokens or []
 
-    # 1. Parse tokens from existing channel post
     for line in lines[1:]:
         stripped = line.strip()
         if not stripped:
@@ -294,7 +294,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
             status, expiry, detected_country, is_active = await check_qobuz_token(http_client, token)
             country = detected_country if detected_country != "UNKNOWN" else item["assigned_country"]
 
-            # Initialize history record if token wasn't seen before
             if token not in history:
                 history[token] = {
                     "first_seen": now_ts,
@@ -306,7 +305,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
 
             token_meta = history[token]
 
-            # Trigger death notification if transitioning to inactive
             if not is_active and not token_meta.get("notified_death", False):
                 await notify_admin_token_died(
                     app=app,
@@ -321,7 +319,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
             token_meta["last_status"] = status
             token_meta["country"] = country
 
-            # Skip dead tokens if purge mode is active
             if purge_dead and not is_active:
                 print(f"[x] Purging dead token ({status}): {token[:12]}...")
                 continue
@@ -337,7 +334,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 "is_active": is_active,
             })
 
-        # Process incoming/unformatted tokens
         for new_token in unformatted_loose_tokens:
             if new_token in seen_tokens:
                 continue
@@ -377,7 +373,6 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                     standby_queue[country].append(new_token)
                 print(f"[~] Quota reached for {country} ({len(active_in_group)}/{max_limit}). Queued to standby.")
 
-        # 2. Replenish dead slots from Standby Queue
         for country, tokens in country_groups.items():
             active_count = sum(1 for t in tokens if t["is_active"])
             slots_needed = max_limit - active_count
@@ -416,12 +411,10 @@ async def update_token_post(app: Client, purge_dead: bool = False, incoming_toke
                 tokens.extend(replenished)
                 standby_queue[country] = remaining_in_queue
 
-    # Save persistence updates
     vault["queue"] = standby_queue
     vault["history"] = history
     save_vault(vault)
 
-    # 3. Build formatted message
     output_parts = [f"<b>{title}</b>\n"]
 
     for idx, (cc, tokens) in enumerate(sorted(country_groups.items()), 1):
@@ -491,6 +484,7 @@ def admin_only_filter(_, __, message: Message):
 
 admin_filter = filters.create(admin_only_filter)
 
+# ---------------- Commands ----------------
 
 @app.on_message(filters.private & admin_filter & filters.command("start"))
 async def dm_start_cmd(_, message: Message):
@@ -577,6 +571,76 @@ async def dm_purge_cmd(client: Client, message: Message):
             await wait_msg.edit_text(f"❌ Failed: {e}")
 
 
+# Put /gen ABOVE the generic text catcher so it runs for everyone
+@app.on_message(filters.private & filters.command("gen"))
+async def dm_gen_cmd(client: Client, message: Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply_text("⚠️ <b>Usage:</b>\n<code>/gen email password</code>", parse_mode=ParseMode.HTML)
+        return
+
+    email = parts[1]
+    password = parts[2]
+    status_msg = await message.reply_text("⏳ Authenticating with Qobuz...")
+
+    params = {
+        "app_id": QOBUZ_APP_ID,
+        "app_secret": "e79f8b9be485692b0e5f9dd895826368",
+        "username": email,
+        "password": password
+    }
+
+    try:
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.get(f"{API_BASE}user/login", params=params, headers=qobuz_headers(""), timeout=15)
+            data = resp.json() if resp.text else {}
+
+            if resp.status_code == 200 and "user_auth_token" in data:
+                token = data.get("user_auth_token")
+                user = data.get("user", {})
+                credential = user.get("credential", {})
+                subscription = user.get("subscription", {})
+
+                country = user.get("country_code", "UNKNOWN")
+                flag = country_code_to_flag(country)
+                
+                plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
+                
+                start_raw = subscription.get("start_date")
+                start_date = format_expiry(start_raw) if start_raw else "N/A"
+                
+                exp_raw = subscription.get("end_date") or credential.get("end_date")
+                exp_date = format_expiry(exp_raw) if exp_raw else "N/A"
+
+                account_type = "👤 Individual"
+                plan_lower = plan_name.lower()
+                if "family" in plan_lower:
+                    if "master" in plan_lower:
+                        account_type = "👨‍👩‍👧‍👦 Family (Parent/Admin)"
+                    elif "member" in plan_lower:
+                        account_type = "👤 Family (Member)"
+                    else:
+                        account_type = "👨‍👩‍👧‍👦 Family Plan"
+
+                text = (
+                    f"✅ <b>Authentication Successful!</b>\n\n"
+                    f"• <b>Country:</b> {country} {flag}\n"
+                    f"• <b>Plan:</b> <code>{plan_name}</code>\n"
+                    f"• <b>Account Role:</b> {account_type}\n"
+                    f"• <b>Start Date:</b> <code>{start_date}</code>\n"
+                    f"• <b>Expiry Date:</b> <code>{exp_date}</code>\n\n"
+                    f"<b>Token:</b>\n"
+                    f"<blockquote><code>{token}</code></blockquote>"
+                )
+                await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
+            else:
+                err = data.get("message") or data.get("error_code") or "Invalid credentials."
+                await status_msg.edit_text(f"❌ <b>Login Failed:</b> <code>{err}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
+
+
+# The catch-all text handler (must be at the bottom of the commands)
 @app.on_message(filters.private & admin_filter & filters.text)
 async def dm_add_tokens_handler(client: Client, message: Message):
     global LAST_CHECK_TIMESTAMP
@@ -688,6 +752,21 @@ async def main():
 
     await start_web_server()
     await app.start()
+    
+    # Register Commands with Telegram UI
+    try:
+        await app.set_bot_commands([
+            BotCommand("gen", "Generate token (email & password)"),
+            BotCommand("start", "Admin: Show admin console"),
+            BotCommand("recheck", "Admin: Force refresh channel post"),
+            BotCommand("purge", "Admin: Remove expired tokens"),
+            BotCommand("limit", "Admin: Set max tokens per region"),
+            BotCommand("queue", "Admin: View standby tokens"),
+        ])
+        print("[+] Bot commands menu updated in Telegram UI!")
+    except Exception as e:
+        print(f"[-] Failed to set bot commands: {e}")
+
     print("[+] Bot started. Executing initial token check...")
 
     try:
@@ -707,70 +786,3 @@ async def main():
 
 if __name__ == "__main__":
     app.run(main())
-
-@app.on_message(filters.private & filters.command("gen"))
-async def dm_gen_cmd(client: Client, message: Message):
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.reply_text("⚠️ <b>Usage:</b>\n<code>/gen email password</code>", parse_mode=ParseMode.HTML)
-        return
-
-    email = parts[1]
-    password = parts[2]
-    status_msg = await message.reply_text("⏳ Authenticating with Qobuz...")
-
-    params = {
-        "app_id": QOBUZ_APP_ID,
-        "app_secret": "e79f8b9be485692b0e5f9dd895826368",
-        "username": email,
-        "password": password
-    }
-
-    try:
-        async with httpx.AsyncClient() as http_client:
-            resp = await http_client.get(f"{API_BASE}user/login", params=params, headers=qobuz_headers(""), timeout=15)
-            data = resp.json() if resp.text else {}
-
-            if resp.status_code == 200 and "user_auth_token" in data:
-                token = data.get("user_auth_token")
-                user = data.get("user", {})
-                credential = user.get("credential", {})
-                subscription = user.get("subscription", {})
-
-                country = user.get("country_code", "UNKNOWN")
-                flag = country_code_to_flag(country)
-                
-                plan_name = credential.get("description") or subscription.get("offer") or "Free / Unknown"
-                
-                start_raw = subscription.get("start_date")
-                start_date = format_expiry(start_raw) if start_raw else "N/A"
-                
-                exp_raw = subscription.get("end_date") or credential.get("end_date")
-                exp_date = format_expiry(exp_raw) if exp_raw else "N/A"
-
-                account_type = "👤 Individual"
-                plan_lower = plan_name.lower()
-                if "family" in plan_lower:
-                    if "master" in plan_lower:
-                        account_type = "👨‍👩‍👧‍👦 Family (Parent/Admin)"
-                    elif "member" in plan_lower:
-                        account_type = "👤 Family (Member)"
-                    else:
-                        account_type = "👨‍👩‍👧‍👦 Family Plan"
-
-                text = (
-                    f"✅ <b>Authentication Successful!</b>\n\n"
-                    f"• <b>Country:</b> {country} {flag}\n"
-                    f"• <b>Plan:</b> <code>{plan_name}</code>\n"
-                    f"• <b>Account Role:</b> {account_type}\n"
-                    f"• <b>Start Date:</b> <code>{start_date}</code>\n"
-                    f"• <b>Expiry Date:</b> <code>{exp_date}</code>\n\n"
-                    f"<b>Token:</b>\n"
-                    f"<blockquote><code>{token}</code></blockquote>"
-                )
-                await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
-            else:
-                err = data.get("message") or data.get("error_code") or "Invalid credentials."
-                await status_msg.edit_text(f"❌ <b>Login Failed:</b> <code>{err}</code>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
