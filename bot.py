@@ -643,7 +643,7 @@ async def dm_gen_cmd(client: Client, message: Message):
                 if source == "household":
                     account_type = "👨‍👩‍👧‍👦 Family Member"
                 elif household_size and household_size > 1:
-                    account_type = f"👑 Family Owner (Max {household_size} Members)"
+                    account_type = "👑 Family Owner"
                 else:
                     account_type = "👤 Individual"
 
