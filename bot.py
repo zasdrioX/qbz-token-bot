@@ -579,8 +579,8 @@ async def dm_gen_cmd(client: Client, message: Message):
         await message.reply_text("⚠️ <b>Usage:</b>\n<code>/gen email password</code>", parse_mode=ParseMode.HTML)
         return
 
-    email = parts[1]
-    password = parts[2]
+    email = parts[1].strip()
+    password = parts[2].strip()
     status_msg = await message.reply_text("⏳ Authenticating with Qobuz...")
 
     params = {
@@ -590,16 +590,24 @@ async def dm_gen_cmd(client: Client, message: Message):
         "password": password
     }
 
+    # Clean headers identical to the working test script
+    login_headers = {
+        "X-Device-Platform": "android",
+        "X-App-Version": "5.16.1.5"
+    }
+
     try:
         async with httpx.AsyncClient() as http_client:
-            resp = await http_client.get(f"{API_BASE}user/login", params=params, headers=qobuz_headers(""), timeout=15)
+            resp = await http_client.get(f"{API_BASE}user/login", params=params, headers=login_headers, timeout=15)
             data = resp.json() if resp.text else {}
 
             if resp.status_code == 200 and "user_auth_token" in data:
                 token = data.get("user_auth_token")
-                user = data.get("user", {})
-                credential = user.get("credential", {})
-                subscription = user.get("subscription", {})
+                user = data.get("user") or {}
+                
+                # Safely handle null data for Family Member accounts
+                credential = user.get("credential") or {}
+                subscription = user.get("subscription") or {}
 
                 country = user.get("country_code", "UNKNOWN")
                 flag = country_code_to_flag(country)
@@ -614,13 +622,13 @@ async def dm_gen_cmd(client: Client, message: Message):
 
                 account_type = "👤 Individual"
                 plan_lower = plan_name.lower()
-                if "family" in plan_lower:
+                source = str(credential.get("source", "")).lower()
+                
+                if "family" in plan_lower or source == "household":
                     if "master" in plan_lower:
                         account_type = "👨‍👩‍👧‍👦 Family (Parent/Admin)"
-                    elif "member" in plan_lower:
-                        account_type = "👤 Family (Member)"
                     else:
-                        account_type = "👨‍👩‍👧‍👦 Family Plan"
+                        account_type = "👤 Family (Member)"
 
                 text = (
                     f"✅ <b>Authentication Successful!</b>\n\n"
@@ -639,8 +647,6 @@ async def dm_gen_cmd(client: Client, message: Message):
     except Exception as e:
         await status_msg.edit_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
 
-
-# The catch-all text handler (must be at the bottom of the commands)
 @app.on_message(filters.private & admin_filter & filters.text)
 async def dm_add_tokens_handler(client: Client, message: Message):
     global LAST_CHECK_TIMESTAMP
